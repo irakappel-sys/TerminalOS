@@ -1,6 +1,6 @@
 # TerminalOS
 
-TerminalOS is a Debian-based, terminal-first Linux distribution with a custom kernel, graphical desktop, installer, signed repositories, and streamlined package-management tools.
+TerminalOS is a terminal-first Linux distribution with a custom kernel, graphical desktop, installer, signed repositories, and streamlined package-management tools.
 
 ## Project status
 
