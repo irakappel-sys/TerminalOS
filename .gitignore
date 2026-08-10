@@ -1,0 +1,23 @@
+# Generated operating-system images
+*.iso
+*.img
+*.raw
+*.qcow2
+*.vdi
+*.vmdk
+
+# Build output and temporary files
+build/
+out/
+dist/
+.cache/
+*.log
+*.tmp
+*.partial
+
+# Language and editor caches
+__pycache__/
+*.py[cod]
+.DS_Store
+.idea/
+.vscode/
