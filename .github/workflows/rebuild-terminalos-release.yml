@@ -1,0 +1,50 @@
+name: Rebuild TerminalOS 1.0.0 release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/rebuild-terminalos-release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: terminalos-v1.0.0-release-repair
+  cancel-in-progress: false
+
+jobs:
+  rebuild-and-replace:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out repair sources
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - name: Install image tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            cpio \
+            initramfs-tools-core \
+            jq \
+            squashfs-tools \
+            xorriso \
+            zstd
+
+      - name: Validate repair sources
+        run: |
+          bash -n tools/rebuild-release.sh
+          python3 -m py_compile \
+            tools/patch-initramfs.py \
+            tools/patch-iso-files.py \
+            tools/patch-rootfs.py \
+            tools/update-md5sum.py
+
+      - name: Rebuild, verify, and replace release image
+        run: bash tools/rebuild-release.sh
+        env:
+          GH_TOKEN: ${{ github.token }}
