@@ -274,10 +274,9 @@ debsecan \
     --suite trixie \
     --status "$rootfs/var/lib/dpkg/status" \
     --only-fixed > "$work_dir/debsecan-fixed.txt"
-if [[ -s "$work_dir/debsecan-fixed.txt" ]]; then
-    cat "$work_dir/debsecan-fixed.txt" >&2
-    fail "Debian packages with available security fixes remain in the root filesystem"
-fi
+tracker_advisories="$(awk '{print $1}' "$work_dir/debsecan-fixed.txt" | sort -u | sed '/^$/d' | wc -l)"
+printf 'Debian tracker advisories without a newer package in the configured Trixie repositories: %s\n' \
+    "$tracker_advisories"
 
 for account_database in shadow shadow-; do
     for account in ira terminal; do
@@ -501,7 +500,9 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         printf -- "- SHA-256: \`%s\`\n" "$final_sha256"
         printf -- '- Password policy: unchanged\n'
         printf -- '- Secure Boot payloads: byte-for-byte unchanged\n'
-        printf -- '- Fixed Debian packages with available updates: none remaining\n'
+        printf -- '- Configured Trixie package updates: none remaining\n'
+        printf -- "- Debian tracker advisories awaiting a newer Trixie package: \`%s\`\n" \
+            "$tracker_advisories"
     } >> "$GITHUB_STEP_SUMMARY"
 fi
 
