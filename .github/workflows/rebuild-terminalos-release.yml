@@ -1,4 +1,4 @@
-name: Rebuild TerminalOS 1.0.0 release
+name: Rebuild TerminalOS 1.0.0 security release
 
 on:
   push:
@@ -6,45 +6,123 @@ on:
       - main
     paths:
       - .github/workflows/rebuild-terminalos-release.yml
+      - tools/**
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
-  group: terminalos-v1.0.0-release-repair
+  group: terminalos-v1.0.0-security-release
   cancel-in-progress: false
 
 jobs:
-  rebuild-and-replace:
+  build-and-audit:
     runs-on: ubuntu-24.04
-    timeout-minutes: 120
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    outputs:
+      iso_sha256: ${{ steps.metadata.outputs.sha256 }}
+      iso_size: ${{ steps.metadata.outputs.size }}
 
     steps:
-      - name: Check out repair sources
-        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Check out audited repair sources without stored credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
 
-      - name: Install image tools
+      - name: Install image and security-audit tools
         run: |
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             cpio \
+            debsecan \
             initramfs-tools-core \
             jq \
+            shellcheck \
             squashfs-tools \
             xorriso \
             zstd
 
       - name: Validate repair sources
         run: |
-          bash -n tools/rebuild-release.sh
+          bash -n \
+            tools/rebuild-release.sh \
+            tools/publish-release.sh
+          shellcheck -x \
+            tools/rebuild-release.sh \
+            tools/publish-release.sh
           python3 -m py_compile \
             tools/patch-initramfs.py \
             tools/patch-iso-files.py \
             tools/patch-rootfs.py \
             tools/update-md5sum.py
 
-      - name: Rebuild, verify, and replace release image
+      - name: Rebuild and audit without a release-write token
         run: bash tools/rebuild-release.sh
         env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+
+      - name: Record audited candidate metadata
+        id: metadata
+        run: |
+          candidate=dist/TerminalOS-1.0.0.iso
+          size="$(stat -c '%s' "$candidate")"
+          sha256="$(sha256sum "$candidate" | awk '{print $1}')"
+          [[ "$size" =~ ^[0-9]+$ ]]
+          [[ "$sha256" =~ ^[0-9a-f]{64}$ ]]
+          printf 'size=%s\n' "$size" >> "$GITHUB_OUTPUT"
+          printf 'sha256=%s\n' "$sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Transfer the audited candidate to the publisher
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: terminalos-v1.0.0-audited-candidate
+          path: |
+            dist/TerminalOS-1.0.0.iso
+            dist/TerminalOS-1.0.0.iso.sha256
+          if-no-files-found: error
+          retention-days: 1
+          compression-level: 0
+
+  publish:
+    needs: build-and-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out publisher code without stored credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Download the audited candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: terminalos-v1.0.0-audited-candidate
+          path: dist
+
+      - name: Verify build-job metadata before publishing
+        env:
+          EXPECTED_SHA256: ${{ needs.build-and-audit.outputs.iso_sha256 }}
+          EXPECTED_SIZE: ${{ needs.build-and-audit.outputs.iso_size }}
+        run: |
+          candidate=dist/TerminalOS-1.0.0.iso
+          [[ "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(stat -c '%s' "$candidate")" == "$EXPECTED_SIZE" ]]
+          [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$EXPECTED_SHA256" ]]
+          (
+            cd dist
+            sha256sum -c TerminalOS-1.0.0.iso.sha256
+          )
+
+      - name: Replace and remotely verify the public release asset
+        run: bash tools/publish-release.sh dist/TerminalOS-1.0.0.iso
+        env:
           GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          EXPECTED_SHA256: ${{ needs.build-and-audit.outputs.iso_sha256 }}
+          EXPECTED_SIZE: ${{ needs.build-and-audit.outputs.iso_size }}
