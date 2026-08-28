@@ -209,6 +209,7 @@ def patch_initramfs(
     path: Path,
     preserve_size: bool,
     unpadded_copy: Path | None,
+    allow_absent: bool,
 ) -> None:
     original = path.read_bytes()
     early_archives, compressed_main = split_early_archives(original)
@@ -228,8 +229,26 @@ def patch_initramfs(
     patched_main, main_removed = patch_cpio_archive(main)
     removed.extend(main_removed)
 
-    if not removed:
+    if not removed and not allow_absent:
         raise RuntimeError("No public random seed was found in the initramfs")
+
+    if not removed:
+        if any(trailing):
+            raise RuntimeError("Non-zero data follows the clean compressed CPIO archive")
+
+        if unpadded_copy is not None:
+            if unpadded_copy.resolve() == path:
+                raise ValueError("Unpadded verification copy must differ from the initramfs")
+
+            unpadded_copy.parent.mkdir(parents=True, exist_ok=True)
+            unpadded_size = len(original) - len(trailing)
+            unpadded_copy.write_bytes(original[:unpadded_size])
+
+        print(
+            f"Verified that {path} already contains no public random seed "
+            f"({compression}, {len(original)} bytes)"
+        )
+        return
 
     output.extend(compress_main(compression, patched_main))
     unpadded_output = bytes(output)
@@ -307,6 +326,11 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="also write the valid archive without exact-size trailing padding",
     )
+    parser.add_argument(
+        "--allow-absent",
+        action="store_true",
+        help="succeed when an already-repaired initramfs contains no public seed",
+    )
     return parser.parse_args()
 
 
@@ -325,6 +349,7 @@ def main() -> int:
             if arguments.unpadded_copy is not None
             else None
         ),
+        allow_absent=arguments.allow_absent,
     )
     return 0
 
