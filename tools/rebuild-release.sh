@@ -280,14 +280,17 @@ printf 'Debian tracker advisories without a newer package in the configured Trix
 
 for account_database in shadow shadow-; do
     for account in ira terminal; do
-        password_field="$(awk -F: -v account="$account" '$1 == account { print $2 }' "$rootfs/etc/$account_database")"
+        password_field="$(as_root awk -F: -v account="$account" \
+            "\$1 == account { print \$2 }" "$rootfs/etc/$account_database")"
         [[ "$password_field" == "!" ]] || \
             fail "$account still has password material in $account_database"
     done
 done
 
 for group_database in group group- gshadow gshadow-; do
-    if awk -F: '$4 ~ /(^|,)terminal(,|$)/ { found=1 } END { exit !found }' "$rootfs/etc/$group_database"; then
+    if as_root awk -F: \
+        "\$4 ~ /(^|,)terminal(,|\$)/ { found=1 } END { exit !found }" \
+        "$rootfs/etc/$group_database"; then
         fail "terminal retains supplementary access in $group_database"
     fi
 done
