@@ -5,6 +5,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import stat
 from pathlib import Path
 
 
@@ -12,6 +13,19 @@ DEBIAN_SOURCES = """deb https://deb.debian.org/debian trixie main contrib non-fr
 deb https://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware
 deb https://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware
 """
+
+
+SYSTEM_PATH_METADATA = {
+    "etc": (0o755, "directory"),
+    "etc/hostname": (0o644, "file"),
+    "etc/lsb-release": (0o644, "file"),
+    "etc/motd": (0o644, "file"),
+    "etc/resolv.conf": (0o644, "file"),
+    "etc/terminalos-release": (0o644, "file"),
+}
+
+TEMPORARY_ACCOUNT_IDS = frozenset((1000, 1001))
+TEMPORARY_HOME_DIRECTORIES = frozenset(("ira", "terminal"))
 
 
 FINALIZER = """#!/bin/sh
@@ -260,6 +274,51 @@ def remove_public_random_seeds(rootfs: Path) -> None:
         path.unlink(missing_ok=True)
 
 
+def repair_system_path_metadata(rootfs: Path) -> None:
+    for relative_path, (mode, expected_type) in SYSTEM_PATH_METADATA.items():
+        path = rootfs / relative_path
+
+        if path.is_symlink() or not path.exists():
+            raise RuntimeError(f"Required system path is missing or a symlink: {path}")
+
+        if expected_type == "directory" and not path.is_dir():
+            raise RuntimeError(f"Required system directory is not a directory: {path}")
+
+        if expected_type == "file" and not path.is_file():
+            raise RuntimeError(f"Required system file is not a regular file: {path}")
+
+        os.chown(path, 0, 0, follow_symlinks=False)
+        path.chmod(mode)
+
+
+def find_unsafe_temporary_ownership(rootfs: Path) -> list[str]:
+    unsafe: list[str] = []
+
+    for directory, directory_names, file_names in os.walk(rootfs, followlinks=False):
+        for name in (*directory_names, *file_names):
+            path = Path(directory) / name
+            relative_path = path.relative_to(rootfs)
+            parts = relative_path.parts
+
+            if (
+                len(parts) >= 2
+                and parts[0] == "home"
+                and parts[1] in TEMPORARY_HOME_DIRECTORIES
+            ):
+                continue
+
+            metadata = path.lstat()
+            if (
+                metadata.st_uid in TEMPORARY_ACCOUNT_IDS
+                or metadata.st_gid in TEMPORARY_ACCOUNT_IDS
+            ):
+                unsafe.append(
+                    f"{metadata.st_uid}:{metadata.st_gid} {relative_path.as_posix()}"
+                )
+
+    return unsafe
+
+
 def reset_machine_identity(rootfs: Path) -> None:
     machine_id = rootfs / "etc/machine-id"
     mode = machine_id.stat().st_mode & 0o7777 if machine_id.exists() else 0o444
@@ -312,6 +371,51 @@ def account_password(rootfs: Path, database: str, username: str) -> str | None:
 
 
 def verify(rootfs: Path) -> None:
+    for relative_path, (expected_mode, _) in SYSTEM_PATH_METADATA.items():
+        path = rootfs / relative_path
+        metadata = path.lstat()
+        actual_mode = stat.S_IMODE(metadata.st_mode)
+
+        if metadata.st_uid != 0 or metadata.st_gid != 0:
+            raise RuntimeError(
+                f"System path is not owned by root:root: "
+                f"{path} ({metadata.st_uid}:{metadata.st_gid})"
+            )
+
+        if actual_mode != expected_mode:
+            raise RuntimeError(
+                f"System path has mode {actual_mode:o}, expected {expected_mode:o}: {path}"
+            )
+
+    unsafe_ownership = find_unsafe_temporary_ownership(rootfs)
+    if unsafe_ownership:
+        details = "\n".join(unsafe_ownership[:20])
+        raise RuntimeError(
+            "Temporary UID/GID owns paths outside the live home directories:\n"
+            f"{details}"
+        )
+
+    writable_etc_paths: list[str] = []
+    for directory, directory_names, file_names in os.walk(
+        rootfs / "etc", followlinks=False
+    ):
+        for name in (*directory_names, *file_names):
+            path = Path(directory) / name
+            metadata = path.lstat()
+
+            if stat.S_ISLNK(metadata.st_mode):
+                continue
+
+            if stat.S_IMODE(metadata.st_mode) & 0o022:
+                writable_etc_paths.append(path.relative_to(rootfs).as_posix())
+
+    if writable_etc_paths:
+        details = "\n".join(writable_etc_paths[:20])
+        raise RuntimeError(
+            "Non-symlink paths under /etc remain group- or world-writable:\n"
+            f"{details}"
+        )
+
     for database in ("shadow", "shadow-"):
         for username in ("ira", "terminal"):
             if account_password(rootfs, database, username) != "!":
@@ -469,6 +573,7 @@ def patch_rootfs(rootfs: Path) -> None:
         if path.exists():
             path.chmod(0o600)
 
+    repair_system_path_metadata(rootfs)
     reset_machine_identity(rootfs)
     scrub_build_residue(rootfs)
     remove_public_random_seeds(rootfs)

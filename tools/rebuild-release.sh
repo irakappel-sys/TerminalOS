@@ -4,7 +4,7 @@ set -Eeuo pipefail
 readonly RELEASE_TAG="v1.0.0"
 readonly ASSET_NAME="TerminalOS-1.0.0.iso"
 readonly EXPECTED_SOURCE_SIZE="1532930048"
-readonly EXPECTED_SOURCE_SHA256="c35694e69921329882d079ecc68c50e50787ff7d615b0d255af840c168c104c8"
+readonly EXPECTED_SOURCE_SHA256="bed73cdec1ce6b0c845e581d077cf92e1a15fdb99e95015e684787bd189ca501"
 readonly SOURCE_DATE_EPOCH="1787192833"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
@@ -206,6 +206,47 @@ upgrade_rootfs() {
     fi
 }
 
+verify_rootfs_ownership() {
+    local unsafe_ownership="$work_dir/unsafe-temporary-ownership.txt"
+    local writable_etc="$work_dir/writable-etc-paths.txt"
+    local metadata
+
+    metadata="$(as_root stat -c '%u:%g:%a' "$rootfs/etc")"
+    [[ "$metadata" == "0:0:755" ]] || \
+        fail "/etc metadata is unsafe: $metadata (expected 0:0:755)"
+
+    for relative_path in \
+        etc/hostname \
+        etc/lsb-release \
+        etc/motd \
+        etc/resolv.conf \
+        etc/terminalos-release
+    do
+        metadata="$(as_root stat -c '%u:%g:%a' "$rootfs/$relative_path")"
+        [[ "$metadata" == "0:0:644" ]] || \
+            fail "/$relative_path metadata is unsafe: $metadata (expected 0:0:644)"
+    done
+
+    as_root find "$rootfs" -xdev \
+        \( -uid 1000 -o -gid 1000 -o -uid 1001 -o -gid 1001 \) \
+        ! -path "$rootfs/home/ira" \
+        ! -path "$rootfs/home/ira/*" \
+        ! -path "$rootfs/home/terminal" \
+        ! -path "$rootfs/home/terminal/*" \
+        -printf '%U:%G %m %p\n' > "$unsafe_ownership"
+    if [[ -s "$unsafe_ownership" ]]; then
+        cat "$unsafe_ownership" >&2
+        fail "temporary account ownership remains outside the live home directories"
+    fi
+
+    as_root find "$rootfs/etc" -xdev ! -type l -perm /022 \
+        -printf '%U:%G %m %p\n' > "$writable_etc"
+    if [[ -s "$writable_etc" ]]; then
+        cat "$writable_etc" >&2
+        fail "non-symlink paths under /etc remain group- or world-writable"
+    fi
+}
+
 printf 'Build workspace: %s\n' "$work_dir"
 df -h "$runner_temp"
 
@@ -259,6 +300,7 @@ hash_identity "$work_dir/terminalos-identity.before.sha256"
 as_root python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
 upgrade_rootfs
 as_root python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
+verify_rootfs_ownership
 
 as_root sha256sum "${policy_paths[@]}" > "$work_dir/password-policy.after.sha256"
 diff -u \
@@ -503,6 +545,8 @@ if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
         printf -- "- SHA-256: \`%s\`\n" "$final_sha256"
         printf -- '- Password policy: unchanged\n'
         printf -- '- Secure Boot payloads: byte-for-byte unchanged\n'
+        printf -- '- Temporary live-account ownership outside home directories: none\n'
+        printf -- '- Group/world-writable non-symlink paths under /etc: none\n'
         printf -- '- Configured Trixie package updates: none remaining\n'
         printf -- "- Debian tracker advisories awaiting a newer Trixie package: \`%s\`\n" \
             "$tracker_advisories"
