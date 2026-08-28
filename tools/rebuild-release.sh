@@ -3,118 +3,230 @@ set -Eeuo pipefail
 
 readonly RELEASE_TAG="v1.0.0"
 readonly ASSET_NAME="TerminalOS-1.0.0.iso"
-readonly TEMP_ASSET_NAME="TerminalOS-1.0.0-repaired.iso"
-readonly EXPECTED_ORIGINAL_SIZE="1532930048"
-readonly EXPECTED_ORIGINAL_SHA256="ea59960de319624eae5cad8df070b0f346224d8b3888427bd02f7aa7e3794311"
-readonly REPAIR_MARKER="terminalos-v1.0.0-repair"
+readonly EXPECTED_SOURCE_SIZE="1532930048"
+readonly EXPECTED_SOURCE_SHA256="c35694e69921329882d079ecc68c50e50787ff7d615b0d255af840c168c104c8"
+readonly SOURCE_DATE_EPOCH="1787192833"
 
 : "${GITHUB_REPOSITORY:?GITHUB_REPOSITORY is required}"
-: "${GH_TOKEN:?GH_TOKEN is required}"
-
-github_token="$GH_TOKEN"
-unset GH_TOKEN
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 runner_temp="${RUNNER_TEMP:-/tmp}"
-work_dir="$(mktemp -d "${runner_temp%/}/terminalos-release-repair.XXXXXX")"
+output_dir="${OUTPUT_DIR:-$repo_root/dist}"
+work_dir="$(mktemp -d "${runner_temp%/}/terminalos-release-build.XXXXXX")"
 download_dir="$work_dir/download"
 files_dir="$work_dir/files"
 rootfs="$work_dir/rootfs"
 verify_dir="$work_dir/verify"
 initramfs_verify_dir="$work_dir/initramfs-verify"
+mounted_paths=()
 
 mkdir -p \
     "$download_dir" \
     "$files_dir/boot" \
     "$files_dir/live" \
     "$verify_dir" \
-    "$initramfs_verify_dir"
+    "$initramfs_verify_dir" \
+    "$output_dir"
 
-original_iso="$download_dir/$ASSET_NAME"
+source_iso="$download_dir/$ASSET_NAME"
 squashfs="$files_dir/live/filesystem.squashfs"
 initramfs="$files_dir/boot/initrd.img"
 initramfs_unpadded="$work_dir/initrd.img.unpadded"
 filesystem_size_file="$files_dir/live/filesystem.size"
 md5_manifest="$files_dir/md5sum.txt"
 new_squashfs="$work_dir/filesystem.squashfs.new"
-temporary_iso="$work_dir/$TEMP_ASSET_NAME"
-final_iso="$work_dir/$ASSET_NAME"
+candidate_iso="$work_dir/$ASSET_NAME"
+final_iso="$output_dir/$ASSET_NAME"
 processors="$(nproc)"
 if (( processors > 8 )); then
     processors=8
 fi
 
 fail() {
-    printf 'release repair: %s\n' "$*" >&2
+    printf 'release build: %s\n' "$*" >&2
     exit 1
 }
 
-github_cli() {
-    GH_TOKEN="$github_token" gh "$@"
+as_root() {
+    if (( EUID == 0 )); then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+unmount_rootfs() {
+    local index
+
+    for (( index=${#mounted_paths[@]} - 1; index >= 0; index-- )); do
+        if mountpoint -q "${mounted_paths[index]}"; then
+            as_root umount --recursive "${mounted_paths[index]}" || \
+                as_root umount --lazy "${mounted_paths[index]}"
+        fi
+    done
+
+    mounted_paths=()
 }
 
 remove_exact_tree() {
     local target="$1"
 
     case "$target" in
-        "$work_dir"/*)
-            sudo find "$target" -xdev -depth -delete
+        "$work_dir"|"$work_dir"/*)
+            if [[ -e "$target" ]]; then
+                as_root find "$target" -xdev -depth -delete
+            fi
             ;;
         *)
-            fail "refusing to remove a path outside the repair directory: $target"
+            fail "refusing to remove a path outside the build directory: $target"
             ;;
     esac
 }
 
-asset_json() {
-    local name="$1"
+cleanup() {
+    local exit_status=$?
+    set +e
+    unmount_rootfs
 
-    github_cli api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG" \
-        --jq ".assets[] | select(.name == \"$name\")"
+    if [[ "${KEEP_WORK_DIR:-0}" != "1" ]]; then
+        remove_exact_tree "$work_dir"
+    else
+        printf 'Preserved build workspace: %s\n' "$work_dir" >&2
+    fi
+
+    exit "$exit_status"
+}
+trap cleanup EXIT INT TERM
+
+rootfs_command() {
+    as_root chroot "$rootfs" /usr/bin/env -i \
+        HOME=/root \
+        LANG=C \
+        LC_ALL=C \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        DEBIAN_FRONTEND=noninteractive \
+        APT_LISTCHANGES_FRONTEND=none \
+        "$@"
 }
 
-verify_remote_asset() {
-    local name="$1"
-    local expected_size="$2"
-    local expected_sha="$3"
-    local json=""
-    local digest=""
-    local size=""
+hash_identity() {
+    local output="$1"
+    local package
 
-    for _ in 1 2 3 4 5 6; do
-        json="$(asset_json "$name")"
+    {
+        for package in \
+            terminalos-base \
+            terminalos-branding \
+            terminalos-network-config \
+            terminalos-package-manager
+        do
+            cat "$rootfs/var/lib/dpkg/info/$package.list"
+        done
+    } | sort -u | while IFS= read -r absolute_path; do
+        [[ "$absolute_path" == "/etc/apt/sources.list" ]] && continue
+        path="$rootfs$absolute_path"
 
-        if [[ -n "$json" ]]; then
-            size="$(jq -r '.size' <<<"$json")"
-            digest="$(jq -r '.digest // empty' <<<"$json")"
-
-            if [[ "$size" == "$expected_size" && "$digest" == "sha256:$expected_sha" ]]; then
-                printf 'Verified remote asset %s (%s bytes, sha256:%s)\n' \
-                    "$name" "$size" "$expected_sha"
-                return 0
-            fi
+        if [[ -L "$path" ]]; then
+            printf 'link  %s  %s\n' "$absolute_path" "$(readlink "$path")"
+        elif [[ -f "$path" ]]; then
+            digest="$(sha256sum "$path" | awk '{print $1}')"
+            printf 'file  %s  %s\n' "$absolute_path" "$digest"
         fi
-
-        sleep 5
-    done
-
-    fail "remote verification failed for $name (size=$size digest=$digest)"
+    done > "$output"
 }
 
-printf 'Repair workspace: %s\n' "$work_dir"
+upgrade_rootfs() {
+    local policy_rc="$rootfs/usr/sbin/policy-rc.d"
+    local policy_backup="$work_dir/policy-rc.d.original"
+    local resolver="$rootfs/etc/resolv.conf"
+    local resolver_backup="$work_dir/resolv.conf.original"
+    local policy_existed=0
+    local resolver_existed=0
+    local pending_upgrades="$work_dir/pending-upgrades.txt"
+    local dpkg_audit="$work_dir/dpkg-audit.txt"
+
+    if [[ -e "$policy_rc" || -L "$policy_rc" ]]; then
+        cp --archive --no-dereference "$policy_rc" "$policy_backup"
+        policy_existed=1
+    fi
+
+    if [[ -e "$resolver" || -L "$resolver" ]]; then
+        cp --archive --no-dereference "$resolver" "$resolver_backup"
+        resolver_existed=1
+    fi
+
+    as_root rm -f "$policy_rc" "$resolver"
+    printf '#!/bin/sh\nexit 101\n' > "$work_dir/policy-rc.d"
+    chmod 0755 "$work_dir/policy-rc.d"
+    as_root install -m 0755 "$work_dir/policy-rc.d" "$policy_rc"
+    as_root install -m 0644 /etc/resolv.conf "$resolver"
+
+    as_root mount --rbind /dev "$rootfs/dev"
+    mounted_paths+=("$rootfs/dev")
+    as_root mount --make-rslave "$rootfs/dev"
+    as_root mount -t proc proc "$rootfs/proc"
+    mounted_paths+=("$rootfs/proc")
+    as_root mount --rbind /sys "$rootfs/sys"
+    mounted_paths+=("$rootfs/sys")
+    as_root mount --make-rslave "$rootfs/sys"
+
+    rootfs_command /usr/bin/apt-get update
+    rootfs_command /usr/bin/apt-get \
+        --yes \
+        --no-install-recommends \
+        -o Dpkg::Use-Pty=0 \
+        -o Dpkg::Options::=--force-confold \
+        full-upgrade
+    rootfs_command /usr/bin/apt-get check
+    rootfs_command /usr/bin/dpkg --audit > "$dpkg_audit"
+    [[ ! -s "$dpkg_audit" ]] || {
+        cat "$dpkg_audit" >&2
+        fail "DPKG reports an incomplete package state after the security upgrade"
+    }
+
+    rootfs_command /usr/bin/apt-get --simulate full-upgrade > "$pending_upgrades"
+    if grep -q '^Inst ' "$pending_upgrades"; then
+        cat "$pending_upgrades" >&2
+        fail "packages remain upgradeable immediately after the security upgrade"
+    fi
+
+    rootfs_command /usr/bin/apt-get clean
+    unmount_rootfs
+
+    as_root rm -f "$policy_rc" "$resolver"
+    if (( policy_existed )); then
+        as_root mv "$policy_backup" "$policy_rc"
+    fi
+    if (( resolver_existed )); then
+        as_root mv "$resolver_backup" "$resolver"
+    fi
+
+    if [[ -d "$rootfs/var/lib/apt/lists" ]]; then
+        as_root find "$rootfs/var/lib/apt/lists" -mindepth 1 -xdev -depth -delete
+    fi
+}
+
+printf 'Build workspace: %s\n' "$work_dir"
 df -h "$runner_temp"
 
-github_cli release download "$RELEASE_TAG" \
-    --repo "$GITHUB_REPOSITORY" \
-    --pattern "$ASSET_NAME" \
-    --dir "$download_dir"
+source_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$ASSET_NAME"
+curl \
+    --fail \
+    --location \
+    --proto '=https' \
+    --retry 4 \
+    --retry-all-errors \
+    --show-error \
+    --silent \
+    --output "$source_iso" \
+    "$source_url"
 
-[[ "$(stat -c '%s' "$original_iso")" == "$EXPECTED_ORIGINAL_SIZE" ]] || \
+[[ "$(stat -c '%s' "$source_iso")" == "$EXPECTED_SOURCE_SIZE" ]] || \
     fail "published ISO size does not match the audited source"
-printf '%s  %s\n' "$EXPECTED_ORIGINAL_SHA256" "$original_iso" | sha256sum -c -
+printf '%s  %s\n' "$EXPECTED_SOURCE_SHA256" "$source_iso" | sha256sum -c -
 
 xorriso -osirrox on \
-    -indev "$original_iso" \
+    -indev "$source_iso" \
     -extract /live/filesystem.squashfs "$squashfs" \
     -extract /boot/initrd.img "$initramfs" \
     -extract /live/filesystem.size "$filesystem_size_file" \
@@ -122,12 +234,17 @@ xorriso -osirrox on \
 
 chmod u+w "$squashfs" "$initramfs" "$filesystem_size_file" "$md5_manifest"
 
-readonly squashfs_extent_size="$(stat -c '%s' "$squashfs")"
-readonly initramfs_extent_size="$(stat -c '%s' "$initramfs")"
-readonly filesystem_size_extent_size="$(stat -c '%s' "$filesystem_size_file")"
-readonly md5_manifest_extent_size="$(stat -c '%s' "$md5_manifest")"
+squashfs_extent_size="$(stat -c '%s' "$squashfs")"
+initramfs_extent_size="$(stat -c '%s' "$initramfs")"
+filesystem_size_extent_size="$(stat -c '%s' "$filesystem_size_file")"
+md5_manifest_extent_size="$(stat -c '%s' "$md5_manifest")"
+readonly \
+    squashfs_extent_size \
+    initramfs_extent_size \
+    filesystem_size_extent_size \
+    md5_manifest_extent_size
 
-sudo unsquashfs -processors "$processors" -d "$rootfs" "$squashfs"
+as_root unsquashfs -processors "$processors" -d "$rootfs" "$squashfs"
 
 policy_paths=(
     "$rootfs/etc/calamares/modules/users.conf"
@@ -136,22 +253,73 @@ policy_paths=(
     "$rootfs/etc/security/pwquality.conf.d/99-terminalos-permissive.conf"
 )
 
-sudo sha256sum "${policy_paths[@]}" > "$work_dir/password-policy.before.sha256"
-sudo python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
+as_root sha256sum "${policy_paths[@]}" > "$work_dir/password-policy.before.sha256"
+hash_identity "$work_dir/terminalos-identity.before.sha256"
 
-sudo chroot "$rootfs" /usr/bin/apt-get --version
-sudo chroot "$rootfs" /usr/bin/dpkg --version
-sudo chroot "$rootfs" /usr/bin/tos --version
-sudo chroot "$rootfs" /usr/bin/tos info bash > "$work_dir/tos-info-bash.txt"
+as_root python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
+upgrade_rootfs
+as_root python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
 
-# apt-cache may regenerate its disposable binary caches during the live check.
-sudo python3 "$repo_root/tools/patch-rootfs.py" "$rootfs"
-sudo sha256sum "${policy_paths[@]}" > "$work_dir/password-policy.after.sha256"
+as_root sha256sum "${policy_paths[@]}" > "$work_dir/password-policy.after.sha256"
 diff -u \
     "$work_dir/password-policy.before.sha256" \
     "$work_dir/password-policy.after.sha256"
 
-rootfs_size="$(sudo du -sx --block-size=1 "$rootfs" | awk '{print $1}')"
+hash_identity "$work_dir/terminalos-identity.after.sha256"
+diff -u \
+    "$work_dir/terminalos-identity.before.sha256" \
+    "$work_dir/terminalos-identity.after.sha256"
+
+debsecan \
+    --suite trixie \
+    --status "$rootfs/var/lib/dpkg/status" \
+    --only-fixed > "$work_dir/debsecan-fixed.txt"
+if [[ -s "$work_dir/debsecan-fixed.txt" ]]; then
+    cat "$work_dir/debsecan-fixed.txt" >&2
+    fail "Debian packages with available security fixes remain in the root filesystem"
+fi
+
+for account_database in shadow shadow-; do
+    for account in ira terminal; do
+        password_field="$(awk -F: -v account="$account" '$1 == account { print $2 }' "$rootfs/etc/$account_database")"
+        [[ "$password_field" == "!" ]] || \
+            fail "$account still has password material in $account_database"
+    done
+done
+
+for group_database in group group- gshadow gshadow-; do
+    if awk -F: '$4 ~ /(^|,)terminal(,|$)/ { found=1 } END { exit !found }' "$rootfs/etc/$group_database"; then
+        fail "terminal retains supplementary access in $group_database"
+    fi
+done
+
+grep -Fxq 'deb https://deb.debian.org/debian trixie main contrib non-free non-free-firmware' \
+    "$rootfs/etc/apt/sources.list"
+grep -Fxq 'deb https://deb.debian.org/debian trixie-updates main contrib non-free non-free-firmware' \
+    "$rootfs/etc/apt/sources.list"
+grep -Fxq 'deb https://security.debian.org/debian-security trixie-security main contrib non-free non-free-firmware' \
+    "$rootfs/etc/apt/sources.list"
+[[ "$(wc -l < "$rootfs/etc/apt/sources.list")" == "3" ]] || \
+    fail "unexpected entries exist in the Debian source list"
+
+[[ ! -s "$rootfs/etc/machine-id" ]] || fail "fixed live machine-id remains"
+[[ -L "$rootfs/var/lib/dbus/machine-id" ]] || fail "D-Bus machine-id is not a symlink"
+[[ "$(readlink "$rootfs/var/lib/dbus/machine-id")" == "/etc/machine-id" ]] || \
+    fail "D-Bus machine-id has an unexpected target"
+
+for secret_file in "$rootfs/etc/ppp/pap-secrets" "$rootfs/etc/ppp/chap-secrets"; do
+    [[ "$(stat -c '%a' "$secret_file")" == "600" ]] || \
+        fail "PPP secret file permissions are not 0600: $secret_file"
+done
+
+as_root chroot "$rootfs" /usr/bin/dpkg --verify terminalos-installer-config > \
+    "$work_dir/installer-package-verify.txt"
+[[ ! -s "$work_dir/installer-package-verify.txt" ]] || {
+    cat "$work_dir/installer-package-verify.txt" >&2
+    fail "patched installer files do not match DPKG integrity metadata"
+}
+
+rootfs_size="$(as_root du -sx --block-size=1 "$rootfs" | awk '{print $1}')"
 python3 - "$filesystem_size_file" "$rootfs_size" <<'PY'
 from pathlib import Path
 import sys
@@ -162,7 +330,7 @@ PY
 [[ "$(stat -c '%s' "$filesystem_size_file")" == "$filesystem_size_extent_size" ]] || \
     fail "filesystem.size no longer fits its original ISO extent"
 
-sudo env SOURCE_DATE_EPOCH=1787192833 \
+as_root env SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" \
     mksquashfs "$rootfs" "$new_squashfs" \
     -comp xz \
     -Xbcj x86 \
@@ -174,12 +342,13 @@ new_squashfs_size="$(stat -c '%s' "$new_squashfs")"
 (( new_squashfs_size <= squashfs_extent_size )) || \
     fail "repaired SquashFS exceeds its original extent: $new_squashfs_size > $squashfs_extent_size"
 
-sudo truncate -s "$squashfs_extent_size" "$new_squashfs"
-sudo chown "$(id -u):$(id -g)" "$new_squashfs"
+as_root truncate -s "$squashfs_extent_size" "$new_squashfs"
+as_root chown "$(id -u):$(id -g)" "$new_squashfs"
 unlink "$squashfs"
 mv "$new_squashfs" "$squashfs"
 
 python3 "$repo_root/tools/patch-initramfs.py" \
+    --allow-absent \
     --preserve-size \
     --unpadded-copy "$initramfs_unpadded" \
     "$initramfs"
@@ -187,7 +356,7 @@ python3 "$repo_root/tools/patch-initramfs.py" \
     fail "repaired initramfs no longer fits its original ISO extent"
 
 unmkinitramfs "$initramfs_unpadded" "$initramfs_verify_dir"
-if sudo find "$initramfs_verify_dir" -type f \
+if as_root find "$initramfs_verify_dir" -type f \
     \( -path '*/.random-seed' \
        -o -path '*/var/lib/systemd/random-seed' \
        -o -path '*/var/lib/urandom/random-seed' \) \
@@ -204,23 +373,20 @@ python3 "$repo_root/tools/update-md5sum.py" "$md5_manifest" \
 [[ "$(stat -c '%s' "$md5_manifest")" == "$md5_manifest_extent_size" ]] || \
     fail "updated md5sum.txt no longer fits its original ISO extent"
 
-remove_exact_tree "$rootfs"
-df -h "$runner_temp"
-
 python3 "$repo_root/tools/patch-iso-files.py" \
-    --original "$original_iso" \
-    --output "$temporary_iso" \
+    --original "$source_iso" \
+    --output "$candidate_iso" \
     --replace /live/filesystem.squashfs "$squashfs" \
     --replace /boot/initrd.img "$initramfs" \
     --replace /live/filesystem.size "$filesystem_size_file" \
     --replace /md5sum.txt "$md5_manifest"
 
-[[ "$(stat -c '%s' "$temporary_iso")" == "$EXPECTED_ORIGINAL_SIZE" ]] || \
+[[ "$(stat -c '%s' "$candidate_iso")" == "$EXPECTED_SOURCE_SIZE" ]] || \
     fail "final ISO size changed"
 
 mkdir -p "$verify_dir/boot" "$verify_dir/live"
 xorriso -osirrox on \
-    -indev "$temporary_iso" \
+    -indev "$candidate_iso" \
     -extract /live/filesystem.squashfs "$verify_dir/live/filesystem.squashfs" \
     -extract /boot/initrd.img "$verify_dir/boot/initrd.img" \
     -extract /live/filesystem.size "$verify_dir/live/filesystem.size" \
@@ -238,35 +404,55 @@ grep -E '  \./(live/filesystem\.(squashfs|size)|boot/initrd\.img)$' \
     md5sum -c selected-md5sums.txt
 )
 
-shadow_entry="$(sudo unsquashfs -cat "$squashfs" etc/shadow | awk -F: '$1 == "ira" { print $2 }')"
-[[ "$shadow_entry" == "!" ]] || fail "the live account still has an embedded password hash"
-
-finalizer_text="$(sudo unsquashfs -cat "$squashfs" usr/local/libexec/terminalos-finalize-installed-system)"
-for forbidden in /var/lib/dpkg /var/lib/apt /etc/apt /usr/bin/apt-get /usr/bin/dpkg libapt-pkg libdpkg; do
-    [[ "$finalizer_text" != *"$forbidden"* ]] || \
-        fail "installer finalizer still deletes package management: $forbidden"
+finalizer_file="$work_dir/terminalos-finalize-installed-system"
+as_root unsquashfs -cat "$squashfs" \
+    usr/local/libexec/terminalos-finalize-installed-system > "$finalizer_file"
+sh -n "$finalizer_file"
+grep -Fq '/usr/bin/apt-get purge --yes --no-install-recommends' "$finalizer_file"
+for forbidden_cleanup in \
+    'rm -rf /var/lib/dpkg' \
+    'rm -rf /var/lib/apt' \
+    'rm -rf /etc/apt'
+do
+    if grep -Fq "$forbidden_cleanup" "$finalizer_file"; then
+        fail "finalizer contains forbidden cleanup: $forbidden_cleanup"
+    fi
 done
 
-for required in usr/bin/apt-get usr/bin/dpkg usr/bin/tos usr/lib/terminalos/tos-backend etc/apt/sources.list var/lib/dpkg/status; do
-    sudo unsquashfs -cat "$squashfs" "$required" > /dev/null
+for required in \
+    usr/bin/apt-get \
+    usr/bin/dpkg \
+    usr/bin/tos \
+    usr/lib/terminalos/tos-backend \
+    etc/apt/sources.list \
+    var/lib/dpkg/status
+do
+    as_root unsquashfs -cat "$squashfs" "$required" > /dev/null
 done
 
 login_script="$work_dir/terminalos-install-mode"
-sudo unsquashfs -cat "$squashfs" usr/local/libexec/terminalos-install-mode > "$login_script"
+as_root unsquashfs -cat "$squashfs" \
+    usr/local/libexec/terminalos-install-mode > "$login_script"
 sh -n "$login_script"
 grep -q 'AutomaticLogin.*ira' "$login_script"
-! grep -q 'terminalos.install=1' "$login_script"
+if grep -q 'terminalos.install=1' "$login_script"; then
+    fail "live autologin is still limited to an installer kernel flag"
+fi
 
 sudoers_file="$work_dir/terminalos-installer.sudoers"
-sudo unsquashfs -cat "$squashfs" etc/sudoers.d/terminalos-installer > "$sudoers_file"
-grep -q 'ira ALL=(ALL:ALL) NOPASSWD: ALL' "$sudoers_file"
-sudo visudo -cf "$sudoers_file"
+as_root unsquashfs -cat "$squashfs" \
+    etc/sudoers.d/terminalos-installer > "$sudoers_file"
+grep -Fxq 'ira ALL=(ALL:ALL) NOPASSWD: ALL' "$sudoers_file"
+visudo -cf "$sudoers_file"
 
-remove_live_user="$(sudo unsquashfs -cat "$squashfs" etc/calamares/modules/shellprocess_remove_live_user.conf)"
-[[ "$remove_live_user" == *"userdel -f -r ira"* ]] || \
-    fail "installer no longer removes the temporary live account"
+remove_live_user="$(as_root unsquashfs -cat "$squashfs" \
+    etc/calamares/modules/shellprocess_remove_live_user.conf)"
+[[ "$remove_live_user" == *'for user in ira terminal'* ]] || \
+    fail "installer does not remove both temporary accounts"
+[[ "$remove_live_user" != *'|| true'* ]] || \
+    fail "installer still ignores temporary-account removal failures"
 
-for image in "$original_iso" "$temporary_iso"; do
+for image in "$source_iso" "$candidate_iso"; do
     report="$work_dir/$(basename "$image").boot-report"
     xorriso -indev "$image" \
         -report_el_torito plain \
@@ -275,8 +461,8 @@ for image in "$original_iso" "$temporary_iso"; do
         > "$report"
 done
 diff -u \
-    "$work_dir/$(basename "$original_iso").boot-report" \
-    "$work_dir/$(basename "$temporary_iso").boot-report"
+    "$work_dir/$(basename "$source_iso").boot-report" \
+    "$work_dir/$(basename "$candidate_iso").boot-report"
 
 secure_boot_paths=(
     /efi.img
@@ -285,129 +471,40 @@ secure_boot_paths=(
     /boot/grub/i386-pc/eltorito.img
 )
 
-mkdir -p "$work_dir/secure-original" "$work_dir/secure-repaired"
+mkdir -p "$work_dir/secure-source" "$work_dir/secure-candidate"
 for iso_path in "${secure_boot_paths[@]}"; do
     safe_name="${iso_path//\//_}"
-    xorriso -osirrox on -indev "$original_iso" \
-        -extract "$iso_path" "$work_dir/secure-original/$safe_name"
-    xorriso -osirrox on -indev "$temporary_iso" \
-        -extract "$iso_path" "$work_dir/secure-repaired/$safe_name"
+    xorriso -osirrox on -indev "$source_iso" \
+        -extract "$iso_path" "$work_dir/secure-source/$safe_name"
+    xorriso -osirrox on -indev "$candidate_iso" \
+        -extract "$iso_path" "$work_dir/secure-candidate/$safe_name"
     cmp \
-        "$work_dir/secure-original/$safe_name" \
-        "$work_dir/secure-repaired/$safe_name"
+        "$work_dir/secure-source/$safe_name" \
+        "$work_dir/secure-candidate/$safe_name"
 done
 
-final_size="$(stat -c '%s' "$temporary_iso")"
-final_sha256="$(sha256sum "$temporary_iso" | awk '{print $1}')"
-[[ "$final_sha256" != "$EXPECTED_ORIGINAL_SHA256" ]] || \
-    fail "repair unexpectedly produced the original ISO checksum"
+final_size="$(stat -c '%s' "$candidate_iso")"
+final_sha256="$(sha256sum "$candidate_iso" | awk '{print $1}')"
+[[ "$final_sha256" != "$EXPECTED_SOURCE_SHA256" ]] || \
+    fail "repair unexpectedly produced the source ISO checksum"
 
-printf 'Uploading recoverable repaired asset before replacing the published filename.\n'
-github_cli release upload "$RELEASE_TAG" "$temporary_iso" \
-    --repo "$GITHUB_REPOSITORY" \
-    --clobber
-verify_remote_asset "$TEMP_ASSET_NAME" "$final_size" "$final_sha256"
-
-original_asset="$(asset_json "$ASSET_NAME")"
-[[ -n "$original_asset" ]] || fail "published release asset disappeared before replacement"
-original_asset_id="$(jq -r '.id' <<<"$original_asset")"
-github_cli api --method DELETE \
-    "repos/$GITHUB_REPOSITORY/releases/assets/$original_asset_id"
-
-mv "$temporary_iso" "$final_iso"
-github_cli release upload "$RELEASE_TAG" "$final_iso" --repo "$GITHUB_REPOSITORY"
-verify_remote_asset "$ASSET_NAME" "$final_size" "$final_sha256"
-
-temporary_asset="$(asset_json "$TEMP_ASSET_NAME")"
-if [[ -n "$temporary_asset" ]]; then
-    temporary_asset_id="$(jq -r '.id' <<<"$temporary_asset")"
-    github_cli api --method DELETE \
-        "repos/$GITHUB_REPOSITORY/releases/assets/$temporary_asset_id"
+if [[ -e "$final_iso" ]]; then
+    unlink "$final_iso"
 fi
-
-release_body="$work_dir/release-body.md"
-current_body="$(github_cli release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json body --jq .body)"
-python3 - "$release_body" "$current_body" "$final_size" "$final_sha256" "$REPAIR_MARKER" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-output = Path(sys.argv[1])
-body = sys.argv[2]
-size = sys.argv[3]
-digest = sys.argv[4]
-marker = sys.argv[5]
-pattern = rf"\n?<!-- {re.escape(marker)} -->.*?<!-- /{re.escape(marker)} -->\n?"
-body = re.sub(pattern, "\n", body, flags=re.DOTALL).rstrip()
-body, size_count = re.subn(
-    r"(?m)^Size: `?\d+`? bytes$",
-    f"Size: {size} bytes",
-    body,
-)
-body, digest_count = re.subn(
-    r"(?m)^SHA-256: `?[0-9a-f]{64}`?$",
-    f"SHA-256: {digest}",
-    body,
-)
-
-missing_metadata = []
-if size_count == 0:
-    missing_metadata.append(f"Size: {size} bytes")
-if digest_count == 0:
-    missing_metadata.append(f"SHA-256: {digest}")
-if missing_metadata:
-    body = (f"{body}\n\n" + "\n\n".join(missing_metadata)).strip()
-
-repair = f"""<!-- {marker} -->
-### Repaired image — 2026-08-27
-
-- Preserves APT, DPKG, repositories, and `tos` after installation.
-- Removes the embedded live-user password hash; live sessions log in without a password, while the installer still creates the installed user's password.
-- Removes the fixed public random seed from the initramfs.
-- Leaves the existing installer password policy and Secure Boot behavior unchanged.
-<!-- /{marker} -->"""
-output.write_text(f"{body}\n\n{repair}\n" if body else f"{repair}\n")
-PY
-github_cli release edit "$RELEASE_TAG" \
-    --repo "$GITHUB_REPOSITORY" \
-    --notes-file "$release_body"
-
-python3 - "$repo_root/README.md" "$final_size" "$final_sha256" <<'PY'
-from pathlib import Path
-import re
-import sys
-
-path = Path(sys.argv[1])
-size = sys.argv[2]
-digest = sys.argv[3]
-text = path.read_text()
-text, size_count = re.subn(r"(?m)^- Size: \d+ bytes$", f"- Size: {size} bytes", text)
-text, digest_count = re.subn(
-    r"(?m)^- SHA-256: `[0-9a-f]{64}`$",
-    f"- SHA-256: `{digest}`",
-    text,
-)
-
-if size_count != 1 or digest_count != 1:
-    raise RuntimeError("README release metadata was not uniquely identifiable")
-
-path.write_text(text)
-PY
-
-git -C "$repo_root" config user.name "github-actions[bot]"
-git -C "$repo_root" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-git -C "$repo_root" add README.md
-git -C "$repo_root" commit -m "Update repaired TerminalOS 1.0.0 checksum"
-git -C "$repo_root" push
+mv "$candidate_iso" "$final_iso"
+printf '%s  %s\n' "$final_sha256" "$ASSET_NAME" > "$output_dir/$ASSET_NAME.sha256"
 
 if [[ -n "${GITHUB_STEP_SUMMARY:-}" ]]; then
     {
-        printf '## TerminalOS 1.0.0 release repaired\n\n'
-        printf -- '- Size: `%s` bytes\n' "$final_size"
-        printf -- '- SHA-256: `%s`\n' "$final_sha256"
-        printf -- '- Published asset: `%s`\n' "$ASSET_NAME"
+        printf '## TerminalOS 1.0.0 security build passed\n\n'
+        printf -- "- Size: \`%s\` bytes\n" "$final_size"
+        printf -- "- SHA-256: \`%s\`\n" "$final_sha256"
+        printf -- '- Password policy: unchanged\n'
+        printf -- '- Secure Boot payloads: byte-for-byte unchanged\n'
+        printf -- '- Fixed Debian packages with available updates: none remaining\n'
     } >> "$GITHUB_STEP_SUMMARY"
 fi
 
+printf 'REPAIRED_ISO=%s\n' "$final_iso"
 printf 'REPAIRED_SIZE=%s\n' "$final_size"
 printf 'REPAIRED_SHA256=%s\n' "$final_sha256"
