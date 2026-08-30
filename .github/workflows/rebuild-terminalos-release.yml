@@ -56,7 +56,8 @@ jobs:
             tools/patch-initramfs.py \
             tools/patch-iso-files.py \
             tools/patch-rootfs.py \
-            tools/update-md5sum.py
+            tools/update-md5sum.py \
+            tools/vm-smoke-test.py
 
       - name: Rebuild and audit without a release-write token
         run: bash tools/rebuild-release.sh
@@ -85,8 +86,61 @@ jobs:
           retention-days: 1
           compression-level: 0
 
-  publish:
+
+  vm_test:
     needs: build-and-audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    outputs:
+      iso_sha256: \${{ steps.metadata.outputs.sha256 }}
+      iso_size: \${{ steps.metadata.outputs.size }}
+
+    steps:
+      - name: Check out VM smoke-test sources without stored credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+
+      - name: Download the audited candidate
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          name: terminalos-v1.0.0-audited-candidate
+          path: dist
+
+      - name: Install QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends qemu-system-x86
+
+      - name: Verify the exact audited candidate
+        id: metadata
+        env:
+          EXPECTED_SHA256: \${{ needs.build-and-audit.outputs.iso_sha256 }}
+          EXPECTED_SIZE: \${{ needs.build-and-audit.outputs.iso_size }}
+        run: |
+          candidate=dist/TerminalOS-1.0.0.iso
+          [[ "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(stat -c '%s' "$candidate")" == "$EXPECTED_SIZE" ]]
+          [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$EXPECTED_SHA256" ]]
+          (
+            cd dist
+            sha256sum -c TerminalOS-1.0.0.iso.sha256
+          )
+          printf 'size=%s\n' "$EXPECTED_SIZE" >> "$GITHUB_OUTPUT"
+          printf 'sha256=%s\n' "$EXPECTED_SHA256" >> "$GITHUB_OUTPUT"
+
+      - name: Boot and exercise the live session in QEMU
+        run: |
+          python3 tools/vm-smoke-test.py \
+            --iso dist/TerminalOS-1.0.0.iso \
+            --boot-timeout 420 \
+            --idle-seconds 300
+
+  publish:
+    needs: [build-and-audit, vm_test]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
@@ -100,12 +154,19 @@ jobs:
 
       - name: Require an exact VM-tested candidate checksum
         id: vm_gate
+        env:
+          BUILT_SHA256: ${{ needs.build-and-audit.outputs.iso_sha256 }}
+          BUILT_SIZE: ${{ needs.build-and-audit.outputs.iso_size }}
+          VM_TESTED_SHA256: ${{ needs.vm_test.outputs.iso_sha256 }}
+          VM_TESTED_SIZE: ${{ needs.vm_test.outputs.iso_size }}
         run: |
-          if [[ -f tools/vm-tested-release.sha256 ]]; then
-            printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
-          else
-            printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
-          fi
+          [[ "$BUILT_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$VM_TESTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$BUILT_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$VM_TESTED_SIZE" =~ ^[0-9]+$ ]]
+          [[ "$BUILT_SHA256" == "$VM_TESTED_SHA256" ]]
+          [[ "$BUILT_SIZE" == "$VM_TESTED_SIZE" ]]
+          printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
 
       - name: Download the audited candidate
         if: steps.vm_gate.outputs.enabled == 'true'
@@ -119,15 +180,15 @@ jobs:
         env:
           EXPECTED_SHA256: ${{ needs.build-and-audit.outputs.iso_sha256 }}
           EXPECTED_SIZE: ${{ needs.build-and-audit.outputs.iso_size }}
+          VM_TESTED_SHA256: ${{ needs.vm_test.outputs.iso_sha256 }}
         run: |
           candidate=dist/TerminalOS-1.0.0.iso
           [[ "$EXPECTED_SIZE" =~ ^[0-9]+$ ]]
           [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$(stat -c '%s' "$candidate")" == "$EXPECTED_SIZE" ]]
           [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$EXPECTED_SHA256" ]]
-          vm_tested_sha256="$(tr -d '[:space:]' < tools/vm-tested-release.sha256)"
-          [[ "$vm_tested_sha256" =~ ^[0-9a-f]{64}$ ]]
-          [[ "$EXPECTED_SHA256" == "$vm_tested_sha256" ]]
+          [[ "$VM_TESTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SHA256" == "$VM_TESTED_SHA256" ]]
           (
             cd dist
             sha256sum -c TerminalOS-1.0.0.iso.sha256
