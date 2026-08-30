@@ -479,9 +479,16 @@ as_root unsquashfs -cat "$squashfs" \
     usr/local/libexec/terminalos-install-mode > "$login_script"
 sh -n "$login_script"
 grep -q 'AutomaticLogin.*ira' "$login_script"
+grep -Fq 'idle-delay=uint32 0' "$login_script"
+grep -Fq 'lock-enabled=false' "$login_script"
+grep -Fq 'disable-lock-screen=true' "$login_script"
+grep -Fq "sleep-inactive-ac-type='nothing'" "$login_script"
+grep -Fq "sleep-inactive-battery-type='nothing'" "$login_script"
 if grep -q 'terminalos.install=1' "$login_script"; then
     fail "live autologin is still limited to an installer kernel flag"
 fi
+
+grep -Fq '/etc/dconf/db/local.d/00-terminalos-live-session' "$finalizer_file"
 
 sudoers_file="$work_dir/terminalos-installer.sudoers"
 as_root unsquashfs -cat "$squashfs" \

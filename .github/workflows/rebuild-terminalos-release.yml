@@ -98,13 +98,24 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Require an exact VM-tested candidate checksum
+        id: vm_gate
+        run: |
+          if [[ -f tools/vm-tested-release.sha256 ]]; then
+            printf 'enabled=true\n' >> "$GITHUB_OUTPUT"
+          else
+            printf 'enabled=false\n' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download the audited candidate
+        if: steps.vm_gate.outputs.enabled == 'true'
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
         with:
           name: terminalos-v1.0.0-audited-candidate
           path: dist
 
       - name: Verify build-job metadata before publishing
+        if: steps.vm_gate.outputs.enabled == 'true'
         env:
           EXPECTED_SHA256: ${{ needs.build-and-audit.outputs.iso_sha256 }}
           EXPECTED_SIZE: ${{ needs.build-and-audit.outputs.iso_size }}
@@ -114,12 +125,16 @@ jobs:
           [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
           [[ "$(stat -c '%s' "$candidate")" == "$EXPECTED_SIZE" ]]
           [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$EXPECTED_SHA256" ]]
+          vm_tested_sha256="$(tr -d '[:space:]' < tools/vm-tested-release.sha256)"
+          [[ "$vm_tested_sha256" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$EXPECTED_SHA256" == "$vm_tested_sha256" ]]
           (
             cd dist
             sha256sum -c TerminalOS-1.0.0.iso.sha256
           )
 
       - name: Replace and remotely verify the public release asset
+        if: steps.vm_gate.outputs.enabled == 'true'
         run: bash tools/publish-release.sh dist/TerminalOS-1.0.0.iso
         env:
           GH_TOKEN: ${{ github.token }}

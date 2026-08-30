@@ -83,6 +83,11 @@ rm -f \
     /etc/sudoers.d/terminalos-installer \
     /etc/security/pwquality.conf.d/99-terminalos-permissive.conf
 
+rm -f /etc/dconf/db/local.d/00-terminalos-live-session
+if command -v dconf >/dev/null 2>&1; then
+    dconf update
+fi
+
 rm -rf \
     /etc/calamares \
     /root/.cache/calamares
@@ -162,7 +167,26 @@ path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(text)
 PY
 
-echo "Passwordless GDM login enabled for the locked live account."
+mkdir -p /etc/dconf/db/local.d
+cat > /etc/dconf/db/local.d/00-terminalos-live-session <<'EOF'
+[org/gnome/desktop/session]
+idle-delay=uint32 0
+
+[org/gnome/desktop/screensaver]
+lock-enabled=false
+
+[org/gnome/desktop/lockdown]
+disable-lock-screen=true
+
+[org/gnome/settings-daemon/plugins/power]
+sleep-inactive-ac-timeout=0
+sleep-inactive-ac-type='nothing'
+sleep-inactive-battery-timeout=0
+sleep-inactive-battery-type='nothing'
+EOF
+dconf update
+
+echo "Passwordless GDM login and lock-free live session enabled for the locked live account."
 """
 
 
@@ -484,6 +508,21 @@ def verify(rootfs: Path) -> None:
 
     if "terminalos.install=1" in login_text:
         raise RuntimeError("Live autologin is still limited to installer mode")
+
+    for required_live_setting in (
+        "idle-delay=uint32 0",
+        "lock-enabled=false",
+        "disable-lock-screen=true",
+        "sleep-inactive-ac-type='nothing'",
+        "sleep-inactive-battery-type='nothing'",
+    ):
+        if required_live_setting not in login_text:
+            raise RuntimeError(
+                f"Live passwordless-session setting is missing: {required_live_setting}"
+            )
+
+    if "/etc/dconf/db/local.d/00-terminalos-live-session" not in finalizer_text:
+        raise RuntimeError("Finalizer does not remove the live-session dconf policy")
 
     sudoers = (rootfs / "etc/sudoers.d/terminalos-installer").read_text()
 
