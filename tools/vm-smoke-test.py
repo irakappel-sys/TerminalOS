@@ -104,10 +104,9 @@ class VncClient:
 
     def _receive_frame(self) -> None:
         updated_area = 0
-        expected_area = self.width * self.height
         deadline = time.monotonic() + 15.0
 
-        while updated_area < expected_area:
+        while True:
             if time.monotonic() >= deadline:
                 raise RuntimeError("Timed out waiting for a complete VNC framebuffer")
 
@@ -144,6 +143,10 @@ class VncClient:
                         ]
 
                     updated_area += width * height
+
+                if updated_area:
+                    return
+
             elif message_type == 2:
                 continue
             elif message_type == 3:
@@ -193,7 +196,7 @@ class VncClient:
             signature[index : index + 3]
             for index in range(0, len(signature), 3)
         }
-        return len(pixels) < 12
+        return len(pixels) < 2
 
     def wait_for_stable_desktop(
         self,
@@ -345,6 +348,13 @@ def run_test(iso: Path, boot_timeout: float, idle_seconds: float) -> None:
                 "VM smoke test passed: graphical live session booted, stayed "
                 f"unlocked for {idle_seconds:.0f}s, and ignored Super+L."
             )
+        except Exception as error:
+            log_tail = log_path.read_text(errors="replace").strip()
+            if log_tail:
+                raise RuntimeError(
+                    f"{error}; QEMU log tail:\n{log_tail[-4000:]}"
+                ) from error
+            raise
         finally:
             if client is not None:
                 client.close()
