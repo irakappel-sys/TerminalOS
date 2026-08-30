@@ -130,8 +130,8 @@ class VncClient:
                         raise RuntimeError("VNC rectangle exceeds the framebuffer")
 
                     raw = self._read_exact(
-                        self.width * 0
-                        + width * height * BYTES_PER_PIXEL
+                        self.sock,
+                        width * height * BYTES_PER_PIXEL
                     )
                     row_size = width * BYTES_PER_PIXEL
                     for row in range(height):
